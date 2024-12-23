@@ -69,7 +69,6 @@ class SpatialEncoderLayer:
 
             lebesgue_p: float = 1.0, init_radius: float = 10.0,
             weights_distribution: str = 'normal',
-            inhibitory_ratio: float = 0.0,
 
             initial_rf_to_input_ratio: float = None, initial_max_rf_sparsity: float = 1.0,
             pruning: TConfig = None,
