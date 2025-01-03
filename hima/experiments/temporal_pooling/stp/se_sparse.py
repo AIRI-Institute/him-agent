@@ -72,6 +72,7 @@ class SpatialEncoderSparseBackend:
 
     def __init__(
             self, *, dense_backend,
+            # TODO: implement initialization from params
             # seed: int,
             # feedforward_sds: Sds, output_sds: Sds,
 
@@ -91,7 +92,7 @@ class SpatialEncoderSparseBackend:
         # set it immediately so we can use pruning controller that relies on it
         self.owner.weights_backend = self
 
-        seed = dense_backend.rng.integers(1_000_000)
+        seed = self.owner.rng.integers(100_000_000)
         self.rng = np.random.default_rng(seed)
 
         # ==> Weights initialization
@@ -115,7 +116,7 @@ class SpatialEncoderSparseBackend:
             self.weights_pow_p = self.get_weight_pow_p()
 
         learning_policy = dense_backend.learning_policy
-        match_op = dense_backend.match_op
+        match_op = dense_backend.match_op_name
         can_use_min_operator = self.match_p == 1.0 and learning_policy == LearningPolicy.LINEAR
         if match_op == 'min' and can_use_min_operator:
             self.match_op = min_match_sparse
@@ -129,7 +130,9 @@ class SpatialEncoderSparseBackend:
 
     def match_input(self, x):
         w = self.weights if self.match_p == 1.0 else self.weights_pow_p
-        return self.match_op(x, w, self.ixs_srt_j, self.shifts_j, self.kxs_srt_ij)
+        return self.match_op(
+            x, w=w, ixs_srt_j=self.ixs_srt_j, shifts=self.shifts_j, srt_i=self.kxs_srt_ij
+        )
 
     def update_weights(self, x: RateSdr, y_sdr, y_rates, u, lr):
         if y_sdr.size == 0:
@@ -222,10 +225,13 @@ class SpatialEncoderSparseBackend:
         import seaborn as sns
         from matplotlib import pyplot as plt
         w, r = self.weights, self.radius
-        w = w / np.expand_dims(r, -1)
+        r = r.mean()
+        w = w / r
         p = self.match_p
-        w = pow_x(w, p, False)
-        sns.histplot(w.flatten())
+        _w = pow_x(w, p, False)
+        eps = 1.0 / 20.0 / self.owner.ff_size
+        _w = _w[_w > eps]
+        sns.histplot(_w)
         plt.show()
 
     @property
@@ -306,7 +312,7 @@ def willshaw_update_sparse(weights, shifts_j, kxs_srt_ij, x, y_sdr, y_rates, lr)
 
     v = y_rates * lr
     for i, vi in zip(y_sdr, v):
-        j, ix_x_sdr = 0, 0
+        j = 0
 
         # traverse synaptic connections `k` of the postsynaptic neuron `i`
         for k in kxs_srt_ij[i]:
@@ -333,7 +339,7 @@ def oja_krotov_update_sparse(weights, shifts_j, kxs_srt_ij, x, u, y_sdr, y_rates
 
     for i, vi in zip(y_sdr, v):
         ui = u[i]
-        j, ix_x_sdr = 0, 0
+        j = 0
 
         # traverse synaptic connections `k` of the postsynaptic neuron `i`
         for k in kxs_srt_ij[i]:

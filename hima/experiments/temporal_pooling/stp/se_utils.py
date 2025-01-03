@@ -21,6 +21,7 @@ from hima.common.utils import isnone
 class WeightsDistribution(Enum):
     NORMAL = 1
     UNIFORM = auto()
+    LOG_NORMAL = auto()
 
 
 class FilterInputPolicy(Enum):
@@ -85,6 +86,13 @@ def sample_weights(
     elif distribution == WeightsDistribution.UNIFORM:
         init_std = get_uniform_std(w_shape[1], lebesgue_p, radius)
         weights = rng.uniform(0., init_std, size=w_shape)
+
+    elif distribution == WeightsDistribution.LOG_NORMAL:
+        init_std = 0.3
+        weights = rng.lognormal(mean=0., sigma=init_std, size=w_shape)
+        rs = np.sum(weights ** lebesgue_p, -1, keepdims=True) ** (1 / lebesgue_p)
+        rs /= radius
+        weights /= rs
 
     else:
         raise ValueError(f'Unsupported distribution: {distribution}')
@@ -237,7 +245,7 @@ def min_match_j(x, w):
     return res
 
 
-def dot_match_sparse(x: SdrArray, w, ixs_srt_j, shifts, srt_i):
+def dot_match_sparse(x: SdrArray, *, w, ixs_srt_j, shifts, srt_i):
     is_batch = isinstance(x, SdrArray)
     match_func = _match_sparse_batch if is_batch else _match_sparse
     return match_func(

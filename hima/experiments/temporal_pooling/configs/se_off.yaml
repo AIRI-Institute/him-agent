@@ -108,16 +108,20 @@ sp:
     weights_distribution: normal
 
     initial_rf_to_input_ratio: 100.0
-    initial_max_rf_sparsity: 0.9
+    initial_max_rf_sparsity: 1.0
 
     # newborn phase
     pruning:
-      n_stages: 10
-      cycle: 100.0
+#      n_stages: 10
+      n_stages: 0
+      cycle: 200.0
       # linear | powerlaw
       mode: powerlaw
-      target_max_rf_sparsity: 0.05
+      target_max_rf_sparsity: 0.5
       target_rf_to_input_ratio: 0.75
+
+#    synaptogenesis:
+#      cycle: 100.0
 
     # Weights power for matching [should be compatible with learning policy, i.e.
     #   lebesgue_p - 1 for krotov (use ... to make it auto-induced), and
@@ -125,8 +129,9 @@ sp:
     # ... | <power>
     match_p: ...
     # For match_p != 1.0 it's always mul ==> u = Ax
-    #   match_p == 1.0: mul or min, which is u = {sum(pairwise_min(a_i, x))}_i
+    #   match_p == 1.0: mul or min, which is u = \sum_i pairwise_min(a_i, x)
     match_op: mul
+#    match_op: min
     # no | additive | multiplicative
     boosting_policy: multiplicative
     min_boosting_k: 0.05
@@ -135,11 +140,13 @@ sp:
     beta: 1.0
     beta_lr: 0.0
 #    beta_lr: 0.0004
+    # abs or relative to K
     soft_extra: 1.0
     # with respect to top K against second top K
     beta_active_mass: [0.72, 0.82]
 
     normalize_output: False
+#    output_extra: 7.0
     output_extra: 4.0
 
     # linear | krotov
@@ -198,8 +205,9 @@ setups:
 #    contrastive: True
 #    encoding_sds: [4000, 40]
 #    encoding_sds: [2000, 20]
-#    encoding_sds: [1000, 10]
-    encoding_sds: [600, 7]
+    encoding_sds: [1000, 10]
+#    encoding_sds: [600, 7]
+#    encoding_sds: [400, 6]
   binary_htm_sparse:
     encoder:
       _base_: sp.htm_sp

@@ -53,7 +53,7 @@ class SpatialEncoderDenseBackend:
     learning_rate: float
 
     def __init__(
-            self, *, owner, seed: int,
+            self, *, owner,
 
             lebesgue_p: float = 1.0, init_radius: float = 10.0,
             weights_distribution: str = 'normal',
@@ -67,7 +67,7 @@ class SpatialEncoderDenseBackend:
         # set it immediately so we can use pruning controller that relies on it
         self.owner.weights_backend = self
 
-        self.rng = np.random.default_rng(seed)
+        self.rng = np.random.default_rng(self.owner.rng.integers(100_000_000))
 
         # ==> Weights initialization
         n_in, n_out = self.owner.ff_size, self.owner.output_size
@@ -199,8 +199,10 @@ class SpatialEncoderDenseBackend:
         w, r = self.weights, self.radius
         w = w / np.expand_dims(r, -1)
         p = self.match_p
-        w = pow_x(w, p, self.has_inhibitory)
-        sns.histplot(w.flatten())
+        _w = pow_x(w, p, False).flatten()
+        eps = 1.0 / 20.0 / self.owner.ff_size
+        _w = _w[_w > eps]
+        sns.histplot(_w)
         plt.show()
 
     @property

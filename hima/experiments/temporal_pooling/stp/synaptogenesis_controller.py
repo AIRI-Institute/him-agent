@@ -3,29 +3,46 @@
 #  All rights reserved.
 #
 #  Licensed under the AGPLv3 license. See LICENSE in the project root for license information.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
+import numpy.typing as npt
+from numba import jit
+from numpy.random import Generator
 
 from hima.common.scheduler import Scheduler
 from hima.common.sds import Sds
+from hima.common.utils import safe_divide
+
+if TYPE_CHECKING:
+    from hima.experiments.temporal_pooling.stp.se import SpatialEncoderLayer
+    from hima.experiments.temporal_pooling.stp.se_sparse import SpatialEncoderSparseBackend
 
 
 class SynaptogenesisController:
+    owner: SpatialEncoderLayer
+    rng: Generator
     stats_update_scheduler: Scheduler
 
     def __init__(
             self, *,
-            feedforward_sds: Sds, output_sds: Sds,
-            synaptogenesis_cycle: float
+            owner,
+            cycle: float
     ):
-        self.feedforward_sds = feedforward_sds
-        self.output_sds = output_sds
+        self.owner = owner
+        # set immediately so, the owner knows about the controller
+        self.owner.synaptogenesis_controller = self
+
+        self.rng = np.random.default_rng(self.owner.rng.integers(100_000_000))
 
         stats_update_schedule = int(
-            synaptogenesis_cycle / self.output_sds.sparsity
+            cycle / self.output_sds.sparsity
         )
         self.stats_update_scheduler = Scheduler(stats_update_schedule)
         self.event_prob = np.clip(
-            5.0 / synaptogenesis_cycle, 0.0, 1.0
+            5.0 / cycle, 0.0, 1.0
         )
         self.synaptogenesis_score = np.zeros(self.output_sds.size, dtype=float)
 
@@ -89,8 +106,6 @@ class SynaptogenesisController:
         self.synaptogenesis_cnt += 1
         self.synaptogenesis_cnt_successful += int(success)
 
-
-
     def recalculate_synaptogenesis_score(self):
         # NB: usually we work in log-space => log_ prefix is mostly omit for vars
         self.health_check()
@@ -99,11 +114,10 @@ class SynaptogenesisController:
 
         # TODO: optimize thresholds and power scaling;
         #   also remember cumulative effect of prob during the cycle for frequent neurons
-        abs_rate_low, abs_rate_high = np.log(20), np.log(100)
-        eff_low, eff_high = np.log(1.5), np.log(20)
 
         # Step 1: deal with absolute rates: sleepy input RF and output
         # TODO: consider increasing random potential part for them
+        abs_rate_low, abs_rate_high = np.log(20), np.log(100)
         self.apply_synaptogenesis_to_metric(
             self.slow_health_check_results['ln(nrfe_in)'],
             abs_rate_low, abs_rate_high,
@@ -112,6 +126,7 @@ class SynaptogenesisController:
         )
 
         # Step 2: deal with sleepy output
+        eff_low, eff_high = np.log(1.5), np.log(20)
         self.apply_synaptogenesis_to_metric(
             self.health_check_results['ln(nrfe_out)'],
             eff_low, eff_high,
@@ -120,19 +135,20 @@ class SynaptogenesisController:
 
         if np.allclose(self.synaptogenesis_score, 0.):
             self.synaptogenesis_score[:] = np.clip(
-                self.rng.normal(-0.02, 0.01, size=self.output_size), 0., 1.0,
+                self.rng.normal(-0.02, 0.01, size=self.owner.output_size),
+                0., 1.0,
             )
 
         print(
-            f'+ {self.output_entropy():.3f}'
-            f' | {self.recognition_strength:.1f}'
+            f'+ {self.owner.output_entropy():.3f}'
+            # f' | {self.recognition_strength:.1f}'
             f' | {self.health_check_results["avg(rfe_out)"]:.3f}'
             f' || {self.synaptogenesis_cnt}'
             f' | {safe_divide(self.synaptogenesis_cnt_successful, self.synaptogenesis_cnt):.2f}'
             f' | {np.sum(self.synaptogenesis_score):.2f}'
-            f' || {self.activation_threshold:.2f}'
-            f' | {self.fast_output_sdr_size_trace.get():.1f}'
-            f' | {self.slow_output_size_trace.get():.2f}'
+            # f' || {self.activation_threshold:.2f}'
+            # f' | {self.fast_output_sdr_size_trace.get():.1f}'
+            # f' | {self.slow_output_size_trace.get():.2f}'
         )
 
         self.synaptogenesis_cnt = 0
@@ -174,10 +190,12 @@ class SynaptogenesisController:
         self.weights[neurons] = normalize_weights(self.weights[neurons])
 
     def health_check(self):
+        backend: SpatialEncoderSparseBackend = self.owner.weights_backend
+
         # current Input Rate
-        in_rate = self.fast_feedforward_trace.get()
+        in_rate = self.owner.fast_feedforward_trace.get()
         # Target Input Rate: average rate of each presynaptic neuron
-        target_in_rate = in_rate.sum() / self.ff_size
+        target_in_rate = in_rate.sum() / self.owner.ff_size
 
         # NB: Most of the following metrics are relative to some target metric
         # NB2: log-space is used to make the metrics more linear (easier plots and separation)
@@ -188,17 +206,22 @@ class SynaptogenesisController:
 
         # RFE^in (Receptive Field Efficiency for matching input):
         # how well each neuron's RF tuned to the input's distribution
-        rfe_in = np.sum(ip[self.rf] * self.weights, axis=1)
+        rfe_in = _get_rfe_in(
+            n_pre=self.owner.ff_size, n_post=self.owner.output_size,
+            ixs_srt_j=backend.ixs_srt_j, weights=backend.weights,
+            shifts_j=backend.shifts_j, ip=ip
+        )
         avg_rfe_in = rfe_in.mean()
         # NRFE^in (Normalized RFE^in): RFE^in relative to its average
         nrfe_in = rfe_in / avg_rfe_in
         log_nrfe_in = np.log(nrfe_in)
 
         # current Output Rate
-        out_rate = self.fast_output_trace.get()
+        # FIXME: should be fast_
+        out_rate = self.owner.slow_output_trace.get()
         # Target Output Rate: average rate of each postsynaptic neuron
         # NB: for binary output = sparsity, but for rate output this does not hold
-        target_out_rate = out_rate.sum() / self.output_size
+        target_out_rate = out_rate.sum() / self.owner.output_size
 
         # OP (Output Popularity): the relative frequency of each postsynaptic neuron
         op = out_rate / target_out_rate
@@ -222,14 +245,19 @@ class SynaptogenesisController:
 
         # NB: for synaptogenesis it is better to track both fast and slow pacing stats
 
-        in_rate = self.slow_feedforward_trace.get()
-        target_in_rate = in_rate.sum() / self.ff_size
+        # FIXME: should be slow_
+        in_rate = self.owner.fast_feedforward_trace.get()
+        target_in_rate = in_rate.sum() / self.owner.ff_size
 
         # relative to target input rate
         ip = in_rate / target_in_rate
 
         # relative to target input rate
-        rfe_in = np.sum(ip[self.rf] * self.weights, axis=1)
+        rfe_in = _get_rfe_in(
+            n_pre=self.owner.ff_size, n_post=self.owner.output_size,
+            ixs_srt_j=backend.ixs_srt_j, weights=backend.weights,
+            shifts_j=backend.shifts_j, ip=ip
+        )
         avg_rfe_in = rfe_in.mean()
         nrfe_in = rfe_in / avg_rfe_in
         log_nrfe_in = np.log(nrfe_in)
@@ -244,7 +272,7 @@ class SynaptogenesisController:
         # helpful metrics for analysis
 
         in_rate = ff_trace.get()
-        target_in_rate = in_rate.sum() / self.ff_size
+        target_in_rate = in_rate.sum() / self.owner.ff_size
 
         ip = in_rate / target_in_rate
         log_ip = np.log(ip)
@@ -272,7 +300,7 @@ class SynaptogenesisController:
         log_lp = np.log(lp)
 
         out_rate = out_trace.get()
-        target_out_rate = out_rate.sum() / self.output_size
+        target_out_rate = out_rate.sum() / self.owner.output_size
 
         op = out_rate / target_out_rate
         log_op = np.log(op)
@@ -303,3 +331,27 @@ class SynaptogenesisController:
             'ln(nrfe_out)': np.maximum(log_nrfe_out, min_ln),
             'std(ln(nrfe_out))': appx_std_log_nrfe_out,
         }
+
+    @property
+    def feedforward_sds(self) -> Sds:
+        return self.owner.feedforward_sds
+
+    @property
+    def output_sds(self) -> Sds:
+        return self.owner.output_sds
+
+
+@jit()
+def _get_rfe_in(n_pre, n_post, ixs_srt_j, weights, shifts_j, ip):
+    # calculates equivalent of `dot(ip[rf], w)` for each neuron `i`
+    rfe_in = np.zeros(n_post, float)
+    k_min = 0
+    for j in range(n_pre):
+        # [k_min:k_max] define kxs in `ixs_srt_j` and `weights` corresponding to the current `j`
+        k_max = shifts_j[j+1]
+        # `ixs_srt_j[k_min:k_max]`: ixs that have synapses with `j`
+        # `weights[k_min:k_max]`: their corresponding synaptic weights
+        rfe_in[ixs_srt_j[k_min:k_max]] += ip[j] * weights[k_min:k_max]
+        k_min = k_max
+
+    return rfe_in

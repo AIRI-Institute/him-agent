@@ -21,11 +21,12 @@ from hima.common.sds import Sds
 from hima.common.timer import timed
 from hima.experiments.temporal_pooling.stats.mean_value import MeanValue, LearningRateParam
 from hima.experiments.temporal_pooling.stats.metrics import entropy
-from hima.experiments.temporal_pooling.stp.pruning_controller_dense import PruningController
+from hima.experiments.temporal_pooling.stp.pruning_controller import PruningController
 from hima.experiments.temporal_pooling.stp.se_utils import (
     boosting, arg_top_k, normalize, FilterInputPolicy, BoostingPolicy, LearningPolicy,
     ActivationPolicy, BackendType
 )
+from hima.experiments.temporal_pooling.stp.synaptogenesis_controller import SynaptogenesisController
 from hima.modules.htm.utils import abs_or_relative
 
 if TYPE_CHECKING:
@@ -71,7 +72,7 @@ class SpatialEncoderLayer:
             weights_distribution: str = 'normal',
 
             initial_rf_to_input_ratio: float = None, initial_max_rf_sparsity: float = 1.0,
-            pruning: TConfig = None,
+            pruning: TConfig = None, synaptogenesis: TConfig = None,
 
             match_p: float | None = None, match_op: str | None = None,
             boosting_policy: str = 'no', min_boosting_k: float = 0.0,
@@ -104,6 +105,7 @@ class SpatialEncoderLayer:
 
         self.output_sds = Sds.make(output_sds)
         k = self.output_sds.active_size
+        print(f'K: {k}')
 
         # ==> Input preprocessing
         self.input_normalization = normalize_input_p > 0.0
@@ -126,13 +128,16 @@ class SpatialEncoderLayer:
         from hima.experiments.temporal_pooling.stp.se_dense import SpatialEncoderDenseBackend
         self.weights_backend = SpatialEncoderDenseBackend(
             owner=self,
-            seed=self.rng.integers(100_000_000),
             lebesgue_p=lebesgue_p, init_radius=init_radius,
             weights_distribution=weights_distribution, initial_rf_sparsity=initial_rf_sparsity,
             match_p=match_p, match_op=match_op,
             learning_policy=learning_policy,
         )
         print_backend_info(self.weights_backend)
+
+        self.synaptogenesis_controller = None
+        if synaptogenesis is not None:
+            self.synaptogenesis_controller = SynaptogenesisController(owner=self, **synaptogenesis)
 
         # ==> Pattern matching
         self.boosting_policy = BoostingPolicy[boosting_policy.upper()]
@@ -165,6 +170,8 @@ class SpatialEncoderLayer:
                 min(soft_top_k, block_size)
             )
 
+        print(f'Soft top K: {self.soft_top_k}')
+
         # ==> Activation [applied to soft partition]
         self.activation_policy = ActivationPolicy[activation_policy.upper()]
 
@@ -185,6 +192,7 @@ class SpatialEncoderLayer:
 
         # ==> Hard partitioning: for learning and output selection
         self.hard_top_k = k + max(k2, output_extra)
+        print(f'Hard top K: {self.hard_top_k}')
 
         # ==> Learning
         # TODO: extract to a separate class
@@ -193,6 +201,7 @@ class SpatialEncoderLayer:
         self.learn = False
         # [:k1] - hebbian, [k:k+k2] - anti-hebbian
         self.learning_set = (k1, k2)
+        print(f'Learning set: {self.learning_set}')
         self.learning_rate = learning_rate
         self.adaptive_lr = adaptive_lr
         if self.adaptive_lr:
@@ -208,6 +217,7 @@ class SpatialEncoderLayer:
         # ==> Output
         self.normalize_output = normalize_output
         self.output_extra = output_extra
+        print(f'Output extra: {self.output_extra}')
 
         self.cnt = 0
         self.loops = 0
@@ -296,8 +306,8 @@ class SpatialEncoderLayer:
             self.print_stats(u, output_sdr)
         if self.periodic_check_scheduler.tick():
             self.periodic_check()
-        # if self.cnt % 50000 == 0:
-        #     self.plot_weights_distr()
+        # if self.cnt % 10000 == 0:
+        #     self.weights_backend.plot_weights_distr()
         # if self.cnt % 10000 == 0:
         #     self.plot_activation_distr(sdr, u, y)
 
@@ -359,7 +369,7 @@ class SpatialEncoderLayer:
             # ==> Learn
             self.update_weights(x, sdr_learn, y_learn, u_raw)
             self.cnt += 1
-            # if self.cnt == 1 or self.cnt % 250_000 == 0:
+            # if self.cnt == 1 or self.cnt % 50_000 == 0:
             #     self.weights_backend.plot_weights_distr()
             # if self.cnt % 10000 == 0:
             #     self.plot_activation_distr(sdr, u, y)
@@ -467,7 +477,7 @@ class SpatialEncoderLayer:
         if self.normalize_output:
             y = normalize(y, has_negative=False)
 
-        # TODO: check if it's needed?
+        # TODO: check if it's needed? (it seems as unnecessary optimization)
         if k_output > 0:
             eps = 0.05 / act_support
             mask = y > eps
@@ -543,12 +553,22 @@ class SpatialEncoderLayer:
     def apply_pruning_step(self, ticks_passed: int = 1):
         pc = self.pruning_controller
         if pc is None or not pc.is_newborn_phase:
+            self.apply_synaptogenesis(ticks_passed)
             return
         if not pc.scheduler.tick(ticks_passed):
             return
 
         self.weights_backend.apply_pruning_step()
         self.ensure_suitable_backend()
+
+    def apply_synaptogenesis(self, ticks_passed: int = 1):
+        sc = self.synaptogenesis_controller
+        if sc is None:
+            return
+        if not sc.stats_update_scheduler.tick(ticks_passed):
+            return
+
+        sc.recalculate_synaptogenesis_score()
 
     def update_beta(self, mu: int = 1):
         schedule = 16
@@ -616,14 +636,13 @@ class SpatialEncoderLayer:
         u_min = 100.0 * u.min() / u_max
         ror = self.output_rate / self.output_sds.sparsity
         w = self.weights_backend.weights
-        eps = r * 0.2 / self.ff_size
-        signs_w = np.sign(w)
-        pos_w = 100.0 * np.count_nonzero(signs_w > eps) / w.size
-        neg_w = 100.0 * np.count_nonzero(signs_w < -eps) / w.size
+        eps = r / 20.0 / self.ff_size
+        pos_w = 100.0 * np.count_nonzero(w > eps) / w.size
+        neg_w = 100.0 * np.count_nonzero(w < -eps) / w.size
         zero_w = 100.0 - pos_w - neg_w
         print(
             f'R={r:.3f} H={self.output_entropy():.3f}'
-            f' B={self.beta:.2f} S={self.output_active_size:.1f}'
+            f' B={self.beta:.2f} Sz={self.output_active_size:.1f}'
             f' SfS={self.fast_soft_size_trace.get():.1f}'
             f'| ROR[{ror.min():.2f}; {ror.max():.2f}]'
             f'| U[{u_min:.1f}%  {u_max:.4f}]'
@@ -701,7 +720,8 @@ class SpatialEncoderLayer:
         ff_sparsity = self.ff_avg_sparsity
         rf_sparsity = self.rf_sparsity
         total_sparsity = ff_sparsity * rf_sparsity
-        should_be_sparse = total_sparsity <= 0.06
+        threshold = 0.06 if self.weights_backend.match_op_name != 'min' else 0.6
+        should_be_sparse = total_sparsity <= threshold
         is_current_dense = isinstance(self.weights_backend, SpatialEncoderDenseBackend)
         if should_be_sparse and is_current_dense:
             from hima.experiments.temporal_pooling.stp.se_sparse import SpatialEncoderSparseBackend
