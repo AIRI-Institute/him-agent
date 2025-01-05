@@ -10,26 +10,16 @@ import numpy.typing as npt
 import torch
 from torch import nn, optim
 
-from hima.common.sdr import SparseSdr
 from hima.experiments.temporal_pooling.stp.mlp_decoder_torch import SymExpModule
 
 
 class MlpClassifier:
+    type: str
+    is_classifier: bool
     layer_dims: list[int]
 
-    # cache
-    sparse_input: SparseSdr
-    dense_input: npt.NDArray[float]
-    sparse_gt: SparseSdr
-    dense_gt_values: npt.NDArray[float]
-    dense_gt_sdr: npt.NDArray[float]
-
-    # learning stage tracking
-    n_updates: int
-
-    accumulated_loss: float | torch.Tensor
-    accumulated_loss_steps: int | None
-    loss_propagation_schedule: int
+    _lr_epoch_step: int
+    _lr_epoch_steps: int
 
     def __init__(
             self,
@@ -37,18 +27,32 @@ class MlpClassifier:
             learning_rate: float,
             seed: int = None,
             collect_losses: int = 0,
-            n_extra_layers: int = 0,
+            n_extra_layers: int | list[int] = 0,
             symexp_logits: bool = False,
     ):
         self.rng = np.random.default_rng(seed)
         self.lr = learning_rate
 
-        if n_extra_layers > 0:
+        self.is_classifier = classification
+        if self.is_classifier:
+            self.type = 'CE classifier'
+            self.loss_func = nn.CrossEntropyLoss()
+        else:
+            self.type = 'MSE regressor'
+            self.loss_func = nn.MSELoss()
+
+        if isinstance(n_extra_layers, list):
+            out_size = layers.pop()
+            for layer in n_extra_layers:
+                layers.append(layer)
+            layers.append(out_size)
+            print(f'MLP {self.type} layers: {layers}')
+        elif n_extra_layers > 0:
             out_size = layers.pop()
             for _ in range(n_extra_layers):
                 layers.append(layers[-1] // 2)
             layers.append(out_size)
-            print(f'MLP classifier layers: {layers}')
+            print(f'MLP {self.type} layers: {layers}')
 
         self.layer_dims = layers
 
@@ -63,12 +67,16 @@ class MlpClassifier:
             nn_layers.append(SymExpModule())
         self.mlp = nn.Sequential(*nn_layers)
 
-        if classification:
-            self.loss_func = nn.CrossEntropyLoss()
-        else:
-            self.loss_func = nn.MSELoss()
+        self.optim = optim.Adam(self.mlp.parameters(), lr=self.lr, weight_decay=1e-5)
 
-        self.optim = optim.Adam(self.mlp.parameters(), lr=self.lr)
+        self._min_lr = self.lr / 20.0
+        self._lr_epoch = lambda lr: int(7.0 / lr)
+        self._lr_scaler = lambda _: 0.8
+        self.lr_scheduler = optim.lr_scheduler.MultiplicativeLR(
+            self.optim, lr_lambda=self._lr_scaler,
+        )
+        self._lr_epoch_step = 0
+        self._lr_epoch_steps = self._lr_epoch(self.lr)
 
         self.collect_losses = collect_losses
         if self.collect_losses > 0:
@@ -92,6 +100,14 @@ class MlpClassifier:
 
         if self.collect_losses:
             self.losses.append(loss.item())
+
+        self._lr_epoch_step += 1
+        if self.lr > self._min_lr and self._lr_epoch_step >= self._lr_epoch_steps:
+            self.lr *= self._lr_scaler(True)
+            self._lr_epoch_step = 0
+            self._lr_epoch_steps = self._lr_epoch(self.lr)
+            # print(f'New LR: {self.lr:.5f} for {self._lr_epoch_steps} steps')
+            self.lr_scheduler.step()
 
     @property
     def input_size(self):
