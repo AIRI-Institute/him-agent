@@ -46,7 +46,9 @@ class TestConfig:
     n_epochs: int
     noise: float
 
-    def __init__(self, eval_first: int, eval_schedule: int, n_epochs: int, noise: float = 0.0):
+    def __init__(
+            self, eval_first: int, eval_schedule: int, n_epochs: int, noise: float = 0.0
+    ):
         self.eval_first = eval_first
         self.eval_scheduler = Scheduler(eval_schedule)
         self.n_epochs = n_epochs
@@ -74,6 +76,7 @@ class SpatialEncoderOfflineExperiment:
             self, config: TConfig, config_path: Path,
             log: bool, seed: int, train: TConfig, test: TConfig,
             setup: TConfig, classifier: TConfig, data: str,
+            enable_autoencoding_task: bool,
             sdr_tracker: TConfig, debug: bool,
             project: str = None,
             wandb_init: TConfig = None,
@@ -125,7 +128,7 @@ class SpatialEncoderOfflineExperiment:
         self.testing = self.config.resolve_object(test, object_type_or_factory=TestConfig)
 
         if encoder is not None:
-            # spatial encoding layer + 1-layer linear ANN classifier
+            # spatial encoding layer + 1-layer linear ANN classifier/regressor
             self.encoder = self.config.resolve_object(
                 encoder, feedforward_sds=self.dataset_sds, output_sds=self.encoding_sds
             )
@@ -149,6 +152,10 @@ class SpatialEncoderOfflineExperiment:
         self.n_classes = self.data.n_classes
         self.classifier: TConfig = classifier
         self.persistent_ann_classifier = self.make_ann_classifier()
+
+        self.enable_autoencoding_task = enable_autoencoding_task
+        if self.enable_autoencoding_task:
+            self.persistent_ann_autoencoder = self.make_ann_autoencoder()
         self.i_train_epoch = 0
         self.set_metrics()
 
@@ -184,6 +191,8 @@ class SpatialEncoderOfflineExperiment:
     def train_epoch_se(self, data):
         n_samples = len(data)
         order = self.rng.permutation(n_samples)
+        # Note that the learn is true -> we do not need results, only the random-order traversing
+        # [= encoding] over the entire dataset with learning enabled.
         self.encode_array(data.sdrs, order=order, learn=True, track=False)
         self.print_encoding_speed('train')
 
@@ -196,30 +205,19 @@ class SpatialEncoderOfflineExperiment:
 
         # ==> train and test epoch-specific ANN classifier
         kn_ann_classifier = self.make_ann_classifier()
+        kn_ann_autoencoder = self.make_ann_autoencoder() if self.enable_autoencoding_task else None
+
         track_sdrs = self.sdr_tracker is not None and self.logger is not None
         n_train_samples = len(train_data)
         train_order = np.arange(n_train_samples)
-        encoded_train_sdrs = self.encode_array(
+        raw_train_sdrs, encoded_train_sdrs = self.encode_array(
             train_data.sdrs, order=train_order, learn=False, track=track_sdrs
         )
         eval_speed = self.get_encoding_speed()
 
-        first_epoch_kn_losses = None
-        final_epoch_kn_losses = None
-        for _ in trange(self.testing.n_epochs):
-            kn_epoch_losses = self.train_epoch_ann_classifier(
-                kn_ann_classifier, encoded_train_sdrs, train_data.targets
-            )
-            # NB: stores only the first epoch losses and remains unchanged further on
-            first_epoch_kn_losses = isnone(first_epoch_kn_losses, kn_epoch_losses)
-            # NB: is overwritten every epoch => stores the last epoch losses after the loop
-            final_epoch_kn_losses = kn_epoch_losses
-
-        final_epoch_kn_loss = np.mean(final_epoch_kn_losses)
-
         n_test_samples = len(test_data)
         test_order = np.arange(n_test_samples)
-        encoded_test_sdrs = self.encode_array(
+        raw_test_sdrs, encoded_test_sdrs = self.encode_array(
             test_data.sdrs, order=test_order, learn=False, track=track_sdrs,
             noise=self.testing.noise
         )
@@ -227,10 +225,36 @@ class SpatialEncoderOfflineExperiment:
         if track_sdrs:
             entropy = self.sdr_tracker.on_sequence_finished(None, ignore=False)['H']
 
-        accuracy = self.evaluate_ann_classifier(
-            kn_ann_classifier, encoded_test_sdrs, self.data.test.targets
+        final_epoch_kn_losses = [0.], [0.]
+        for ii in trange(self.testing.n_epochs):
+            kn_epoch_losses = self.train_epoch_ann_classifier(
+                kn_ann_classifier, encoded_train_sdrs, train_data.targets,
+                autoencoder=kn_ann_autoencoder, ae_targets=raw_train_sdrs
+            )
+            # NB: is overwritten every epoch => stores the last epoch losses after the loop
+            final_epoch_kn_losses = kn_epoch_losses
+
+            if ii % 5 == 0:
+                accuracy, ae_accuracy = self.evaluate_ann_classifier(
+                    kn_ann_classifier, encoded_test_sdrs, self.data.test.targets,
+                    autoencoder=kn_ann_autoencoder, ae_targets=raw_test_sdrs
+                )
+                self.print_decoder_quality(
+                    kn_ann_classifier, accuracy, np.mean(kn_epoch_losses[0])
+                )
+                if kn_ann_autoencoder is not None:
+                    self.print_decoder_quality(
+                        kn_ann_autoencoder, ae_accuracy, np.mean(kn_epoch_losses[1]), prefix='AE'
+                    )
+
+        final_epoch_kn_losses, final_epoch_kn_ae_losses = final_epoch_kn_losses
+        final_epoch_kn_loss = np.mean(final_epoch_kn_losses)
+
+        accuracy, ae_accuracy = self.evaluate_ann_classifier(
+            kn_ann_classifier, encoded_test_sdrs, self.data.test.targets,
+            autoencoder=kn_ann_autoencoder, ae_targets=raw_test_sdrs
         )
-        self.print_decoder_quality(accuracy, final_epoch_kn_loss)
+        self.print_decoder_quality(kn_ann_classifier, accuracy, final_epoch_kn_loss)
 
         # add metrics
         epoch_metrics = {
@@ -245,6 +269,16 @@ class SpatialEncoderOfflineExperiment:
         if entropy is not None:
             epoch_metrics['se_entropy'] = entropy
 
+        if kn_ann_autoencoder is not None:
+            final_epoch_kn_ae_loss = np.mean(final_epoch_kn_ae_losses)
+            self.print_decoder_quality(
+                kn_ann_autoencoder, ae_accuracy, final_epoch_kn_ae_loss, prefix='AE'
+            )
+            epoch_metrics |= {
+                'kn_ae_loss': final_epoch_kn_ae_loss,
+                'kn_ae_accuracy': ae_accuracy,
+            }
+
         self.log_progress(epoch_metrics)
         self.print_encoding_speed('eval')
         print('<== Test')
@@ -258,6 +292,8 @@ class SpatialEncoderOfflineExperiment:
         Testing schedule determines when to evaluate the classifier on the test dataset.
         """
         classifier = self.persistent_ann_classifier
+        autoencoder = self.persistent_ann_autoencoder if self.enable_autoencoding_task else None
+
         train_sdrs, train_targets = self.data.train.sdrs, self.data.train.targets
         test_data = self.data.test
 
@@ -267,45 +303,76 @@ class SpatialEncoderOfflineExperiment:
             self.print_with_timestamp(f'Epoch {self.i_train_epoch}')
             # NB: it is `nn_` instead of `kn` as both first and second layers trained for N epochs,
             # i.e. K-N mode for 2-layer ANN is N-N mode.
-            nn_epoch_losses = self.train_epoch_ann_classifier(classifier, train_sdrs, train_targets)
-            self.test_epoch_ann(classifier, test_data, nn_epoch_losses)
+            nn_epoch_losses = self.train_epoch_ann_classifier(
+                classifier, train_sdrs, train_targets, autoencoder=autoencoder
+            )
+            self.test_epoch_ann(classifier, test_data, nn_epoch_losses, autoencoder=autoencoder)
 
-    def train_epoch_ann_classifier(self, classifier, sdrs, targets):
+    def train_epoch_ann_classifier(
+            self, classifier, sdrs, targets, *, autoencoder=None, ae_targets=None
+    ):
         n_samples = len(sdrs)
         order = self.rng.permutation(n_samples)
         batched_indices = split_to_batches(order, self.training.batch_size)
 
         losses = []
+        ae_losses = []
         for batch_ixs in batched_indices:
             batch = sdrs.get_batch_dense(batch_ixs)
             target_cls = targets[batch_ixs]
             classifier.learn(batch, target_cls)
             losses.append(classifier.losses[-1])
 
-        return losses
+            if autoencoder is not None:
+                ae_target_batch = (
+                    batch if ae_targets is None
+                    else ae_targets.get_batch_dense(batch_ixs)
+                )
+                autoencoder.learn(batch, ae_target_batch)
+                ae_losses.append(autoencoder.losses[-1])
 
-    def test_epoch_ann(self, classifier, data, nn_epoch_losses):
+        return losses, ae_losses
+
+    def test_epoch_ann(
+            self, classifier, data, nn_epoch_losses, *, autoencoder=None
+    ):
         if not self.should_test():
             return
 
+        nn_epoch_losses, nn_epoch_ae_losses = nn_epoch_losses
+
         nn_epoch_loss = np.mean(nn_epoch_losses)
-        accuracy = self.evaluate_ann_classifier(
-            classifier, data.sdrs, data.targets, noise=self.testing.noise
+        accuracy, ae_accuracy = self.evaluate_ann_classifier(
+            classifier, data.sdrs, data.targets,
+            noise=self.testing.noise, autoencoder=autoencoder
         )
-        self.print_decoder_quality(accuracy, nn_epoch_loss)
+        self.print_decoder_quality(classifier, accuracy, nn_epoch_loss)
 
         epoch_metrics = {
             'kn_loss': nn_epoch_loss,
             'kn_accuracy': accuracy,
         }
+
+        if autoencoder is not None:
+            nn_epoch_ae_loss = np.mean(nn_epoch_ae_losses)
+            self.print_decoder_quality(autoencoder, ae_accuracy, nn_epoch_ae_loss, prefix='AE')
+
+            epoch_metrics |= {
+                'kn_ae_loss': nn_epoch_ae_loss,
+                'kn_ae_accuracy': ae_accuracy,
+            }
+
         self.log_progress(epoch_metrics)
 
-    def evaluate_ann_classifier(self, classifier, sdrs, targets, noise=0.):
+    def evaluate_ann_classifier(
+            self, classifier, sdrs, targets, *, noise=0., autoencoder=None, ae_targets=None
+    ):
         n_samples = len(sdrs)
         order = np.arange(n_samples)
         batched_indices = split_to_batches(order, self.training.batch_size)
 
         sum_accuracy = 0.0
+        sum_ae_accuracy = 0.0
         for batch_ixs in batched_indices:
             if noise > 0.0:
                 batch_sdrs = sdrs.create_slice(batch_ixs)
@@ -317,12 +384,23 @@ class SpatialEncoderOfflineExperiment:
             target_cls = targets[batch_ixs]
 
             prediction = classifier.predict(batch_sdrs)
-            sum_accuracy += self.get_accuracy(prediction, target_cls)
+            sum_accuracy += self.get_accuracy(classifier, prediction, target_cls)
 
-        return sum_accuracy / n_samples
+            if autoencoder is not None:
+                ae_prediction = autoencoder.predict(batch_sdrs)
+                ae_target_batch = (
+                    batch_sdrs if ae_targets is None
+                    else ae_targets.get_batch_dense(batch_ixs)
+                )
+                sum_ae_accuracy += self.get_accuracy(autoencoder, ae_prediction, ae_target_batch)
 
-    def encode_array(self, sdrs: SdrArray, *, order, learn=False, track=False, noise=0.):
+        return sum_accuracy / n_samples, sum_ae_accuracy / n_samples
+
+    def encode_array(
+            self, sdrs: SdrArray, *, order, learn=False, track=False, noise=0.
+    ):
         assert self.encoder is not None, 'Encoder is not defined'
+        raw_sdrs = []
         encoded_sdrs = []
 
         if getattr(self.encoder, 'compute_batch', False):
@@ -332,6 +410,7 @@ class SpatialEncoderOfflineExperiment:
             for batch_ixs in tqdm(batched_indices):
                 batch_sdrs = sdrs.create_slice(batch_ixs)
                 batch_sdrs = self.apply_noise_to_input(batch_sdrs, noise)
+                raw_sdrs.extend(batch_sdrs.sparse)
 
                 encoded_batch: SdrArray = self.encoder.compute_batch(batch_sdrs, learn=learn)
                 if track:
@@ -342,6 +421,7 @@ class SpatialEncoderOfflineExperiment:
             for ix in tqdm(order):
                 obs_sdr = sdrs.get_sdr(ix, binary=self.is_binary)
                 obs_sdr = self.apply_noise_to_input(obs_sdr, noise)
+                raw_sdrs.append(wrap_as_rate_sdr(obs_sdr))
 
                 enc_sdr = self.encoder.compute(obs_sdr, learn=learn)
                 enc_sdr = wrap_as_rate_sdr(enc_sdr)
@@ -349,7 +429,9 @@ class SpatialEncoderOfflineExperiment:
                     self.sdr_tracker.on_sdr_updated(enc_sdr, ignore=False)
                 encoded_sdrs.append(enc_sdr)
 
-        return SdrArray(sparse=encoded_sdrs, sdr_size=self.encoding_sds.size)
+        raw_sdrs = SdrArray(sparse=raw_sdrs, sdr_size=self.dataset_sds.size)
+        encoded_sdrs = SdrArray(sparse=encoded_sdrs, sdr_size=self.encoding_sds.size)
+        return raw_sdrs, encoded_sdrs
 
     def apply_noise_to_input(self, sdr, noise):
         if noise == 0.0:
@@ -382,8 +464,9 @@ class SpatialEncoderOfflineExperiment:
         metrics['epoch'] = self.i_train_epoch
         self.logger.log(metrics)
 
-    def get_accuracy(self, predictions, targets):
-        if self.classification:
+    @staticmethod
+    def get_accuracy(mlp: MlpClassifier, predictions, targets):
+        if mlp.is_classifier:
             # number of correct predictions in a batch
             return np.count_nonzero(np.argmax(predictions, axis=-1) == targets)
 
@@ -403,11 +486,35 @@ class SpatialEncoderOfflineExperiment:
             symexp_logits=self.classifier_symexp_logits
         )
 
-    def print_decoder_quality(self, accuracy, nn_epoch_loss):
-        if self.classification:
-            print(f'MLP Accuracy: {accuracy:.3%} | Loss: {nn_epoch_loss:.3f}')
+    def make_ann_autoencoder(self) -> MlpClassifier:
+        # actually, we make a decoder part of the autoencoder if Hebbian encoder is provided,
+        # or make a full autoencoder for the full-ANN baseline
+        in_size = out_size = self.dataset_sds.size
+        enc_size = self.encoding_sds.size
+
+        layers = [in_size] if self.encoder is None else []
+        layers += [enc_size, out_size]
+
+        # the only difference from `make_ann_classifier` are:
+        #   - `out_size` for layers
+        #   - `classification = False`, since it's a regressor
+        return self.config.resolve_object(
+            self.classifier, object_type_or_factory=MlpClassifier,
+            layers=layers,
+            classification=False,
+            symexp_logits=self.classifier_symexp_logits
+        )
+
+    @staticmethod
+    def print_decoder_quality(
+            mlp: MlpClassifier, accuracy, nn_epoch_loss, prefix: str = ''
+    ):
+        if mlp.is_classifier:
+            print(f'Accuracy: {accuracy:.3%} | Loss: {nn_epoch_loss:.4f}')
         else:
-            print(f'MLP MSE: {accuracy:.3} | Loss: {nn_epoch_loss:.3f}')
+            if len(prefix) > 0:
+                prefix = prefix + ' '
+            print(f'{prefix}MSE: {accuracy:.7f} | Loss: {nn_epoch_loss:.7f}')
 
     @staticmethod
     def _get_setup(
@@ -459,6 +566,8 @@ class SpatialEncoderOfflineExperiment:
         self.logger.define_metric("se_entropy", step_metric="epoch")
         self.logger.define_metric("kn_loss", step_metric="epoch")
         self.logger.define_metric("kn_accuracy", step_metric="epoch")
+        self.logger.define_metric("kn_ae_loss", step_metric="epoch")
+        self.logger.define_metric("kn_ae_accuracy", step_metric="epoch")
 
 
 def personalize_metrics(metrics: dict, prefix: str):
