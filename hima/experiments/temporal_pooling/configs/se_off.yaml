@@ -12,18 +12,20 @@ train:
 test:
   eval_first: 3
   eval_schedule: 5
-  n_epochs: 20
-#  n_epochs: 30
+  n_epochs: 5
   noise: 0.0
 
 classifier:
   classification: ???
   layers: ???
-  n_extra_layers: 0
-#  learning_rate: 0.0003
-  learning_rate: 0.003
+  n_extra_layers: []
+  # for ANN and Hebb
+#  learning_rate: 0.0006
+  learning_rate: 0.06
   collect_losses: 1
   symexp_logits: ???
+
+enable_autoencoding_task: False
 
 sp:
   htm_sp:
@@ -165,12 +167,16 @@ sp:
 setups:
   rate_ann:
     input_mode: rate
+    ds_norm: l2
     grayscale: True
+#    grayscale: False
     contrastive: False
-    # classifier_symexp_logits: True
+#    classifier_symexp_logits: True
     encoding_sds: [128, 1]
+#    encoding_sds: [256, 1]
   rate_ann_2k:
     input_mode: rate
+    ds_norm: l2
     encoding_sds: [2000, 1]
   rate_soft_hebb:
     encoder: sp.soft_hebb
@@ -205,9 +211,9 @@ setups:
 #    contrastive: True
 #    encoding_sds: [4000, 40]
 #    encoding_sds: [2000, 20]
-    encoding_sds: [1000, 10]
-#    encoding_sds: [600, 7]
-#    encoding_sds: [400, 6]
+#    encoding_sds: [1000, 10]
+    encoding_sds: [600, 7]
+#    encoding_sds: [100, 2]
   binary_htm_sparse:
     encoder:
       _base_: sp.htm_sp
