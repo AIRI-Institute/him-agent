@@ -67,7 +67,8 @@ class MlpClassifier:
             nn_layers.append(SymExpModule())
         self.mlp = nn.Sequential(*nn_layers)
 
-        self.optim = optim.Adam(self.mlp.parameters(), lr=self.lr, weight_decay=1e-5)
+        self.optim = optim.Adam(self.mlp.parameters(), lr=self.lr, weight_decay=1e-6)
+        # self.optim = optim.Adam(self.mlp.parameters(), lr=self.lr)
 
         self._min_lr = self.lr / 20.0
         self._lr_epoch = lambda lr: int(7.0 / lr)

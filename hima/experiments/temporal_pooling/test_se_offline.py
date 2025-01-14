@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 from tqdm import tqdm, trange
 
 from hima.common.config.base import TConfig
@@ -16,7 +17,7 @@ from hima.common.config.global_config import GlobalConfig
 from hima.common.lazy_imports import lazy_import
 from hima.common.run.wandb import get_logger
 from hima.common.scheduler import Scheduler
-from hima.common.sdr import OutputMode, wrap_as_rate_sdr
+from hima.common.sdr import OutputMode, wrap_as_rate_sdr, RateSdr
 from hima.common.sdr_array import SdrArray
 from hima.common.sds import Sds
 from hima.common.timer import timer, print_with_timestamp
@@ -144,10 +145,12 @@ class SpatialEncoderOfflineExperiment:
                 normalize_ds, norm=ds_norm,
                 p=getattr(self.encoder, 'lebesgue_p', None)
             )
-            self.data.train.normalize(normalizer)
-            self.data.test.normalize(normalizer)
         else:
             self.encoder = None
+            normalizer = partial(normalize_ds, norm=ds_norm, p=None)
+
+        self.data.train.normalize(normalizer)
+        self.data.test.normalize(normalizer)
 
         self.n_classes = self.data.n_classes
         self.classifier: TConfig = classifier
@@ -354,7 +357,7 @@ class SpatialEncoderOfflineExperiment:
         }
 
         if autoencoder is not None:
-            nn_epoch_ae_loss = np.mean(nn_epoch_ae_losses)
+            nn_epoch_ae_loss = np.mean(nn_epoch_ae_losses) ** 0.5
             self.print_decoder_quality(autoencoder, ae_accuracy, nn_epoch_ae_loss, prefix='AE')
 
             epoch_metrics |= {
@@ -392,6 +395,12 @@ class SpatialEncoderOfflineExperiment:
                     batch_sdrs if ae_targets is None
                     else ae_targets.get_batch_dense(batch_ixs)
                 )
+                if sum_ae_accuracy == 0.:
+                    plot_img(
+                        (32, 32), [ae_target_batch, ae_prediction], 0,
+                        with_err=True
+                    )
+
                 sum_ae_accuracy += self.get_accuracy(autoencoder, ae_prediction, ae_target_batch)
 
         return sum_accuracy / n_samples, sum_ae_accuracy / n_samples
@@ -470,8 +479,10 @@ class SpatialEncoderOfflineExperiment:
             # number of correct predictions in a batch
             return np.count_nonzero(np.argmax(predictions, axis=-1) == targets)
 
-        # MSE over each prediction coordinates => sum MSE over a batch
-        return np.mean((predictions - targets) ** 2, axis=-1).sum()
+        # MAE over each prediction coordinates => sum MAE over batch
+        return np.sum(
+            np.mean(np.abs(predictions - targets), axis=-1)
+        )
 
     def make_ann_classifier(self) -> MlpClassifier:
         in_size, out_size = self.dataset_sds.size, self.n_classes
@@ -495,11 +506,15 @@ class SpatialEncoderOfflineExperiment:
         layers = [in_size] if self.encoder is None else []
         layers += [enc_size, out_size]
 
+        autoencoder_config = self.classifier.copy()
+        # autoencoder_config['learning_rate'] = 0.002
+        autoencoder_config['learning_rate'] /= 5
+
         # the only difference from `make_ann_classifier` are:
         #   - `out_size` for layers
         #   - `classification = False`, since it's a regressor
         return self.config.resolve_object(
-            self.classifier, object_type_or_factory=MlpClassifier,
+            autoencoder_config, object_type_or_factory=MlpClassifier,
             layers=layers,
             classification=False,
             symexp_logits=self.classifier_symexp_logits
@@ -510,11 +525,11 @@ class SpatialEncoderOfflineExperiment:
             mlp: MlpClassifier, accuracy, nn_epoch_loss, prefix: str = ''
     ):
         if mlp.is_classifier:
-            print(f'Accuracy: {accuracy:.3%} | Loss: {nn_epoch_loss:.4f}')
+            print(f'Accuracy: {accuracy:.3%} | KL Loss: {nn_epoch_loss:.4f}')
         else:
             if len(prefix) > 0:
                 prefix = prefix + ' '
-            print(f'{prefix}MSE: {accuracy:.7f} | Loss: {nn_epoch_loss:.7f}')
+            print(f'{prefix}MAE: {accuracy:.7f} | sqrtMSE Loss: {nn_epoch_loss:.7f}')
 
     @staticmethod
     def _get_setup(
@@ -595,3 +610,57 @@ def normalize_ds(ds, norm, p=None):
     if np.ndim(r_p) > 0:
         r_p = r_p[:, np.newaxis]
     return ds / r_p
+
+
+def plot_img(
+        shape, img: list | RateSdr | SdrArray | npt.NDArray[float], ind: int = 0,
+        with_err: bool = False
+):
+    images = to_images(shape, img, ind, with_err)
+    n_images = len(images)
+
+    import matplotlib.pyplot as plt
+    _, axes = plt.subplots(1, n_images, sharey=True)
+
+    for i in range(n_images):
+        img = images[i]
+        ax = axes[i] if n_images > 1 else axes
+        ax.imshow(img)
+        # print(img[16])
+
+    plt.pause(2)
+    plt.close()
+
+
+def to_images(
+        shape, img: list | RateSdr | SdrArray | npt.NDArray[float], ind: int = 0,
+        with_err: bool = False
+):
+    sz = np.prod(shape)
+    images = img
+    if not isinstance(images, list):
+        images = [images]
+    n_images = len(images)
+
+    result = []
+    for i in range(n_images):
+        img = images[i]
+
+        if isinstance(img, SdrArray):
+            img = img.get_sdr(ind).to_dense(sz)
+        elif isinstance(img, RateSdr):
+            img = img.to_dense(sz)
+        elif isinstance(img, np.ndarray):
+            if img.ndim > 1:
+                img = img[ind]
+        else:
+            print(type(img))
+
+        img = img.reshape(shape)
+        result.append(img)
+
+        if with_err and i % 2 == 1:
+            result.append(
+                np.abs(result[-1] - result[-2])
+            )
+    return result

@@ -123,6 +123,8 @@ def _load_dataset(
 
     # NB: to get sdr for rate sdrs
     threshold = 1.0 / normalizer
+    # TODO: for debug purposes!
+    # threshold = 5.0 / normalizer
 
     from pathlib import Path
     cache_path = Path(f'~/data/_cache/{ds_name}{"_gs" if grayscale else ""}.pkl')

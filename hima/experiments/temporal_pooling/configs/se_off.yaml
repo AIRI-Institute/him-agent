@@ -10,17 +10,20 @@ train:
   n_epochs: 30
   batch_size: 64
 test:
-  eval_first: 3
+  eval_first: 2
   eval_schedule: 5
-  n_epochs: 5
+  n_epochs: 15
   noise: 0.0
 
 classifier:
   classification: ???
   layers: ???
   n_extra_layers: []
-  # for ANN and Hebb
+  #  No norm
 #  learning_rate: 0.0006
+  #  L2
+#  learning_rate: 0.02
+  #  L1
   learning_rate: 0.06
   collect_losses: 1
   symexp_logits: ???
@@ -148,15 +151,15 @@ sp:
     beta_active_mass: [0.72, 0.82]
 
     normalize_output: False
-#    output_extra: 7.0
-    output_extra: 4.0
+    output_extra: 10.0
+#    output_extra: 4.0
 
     # linear | krotov
     learning_policy: linear
 #    learning_policy: krotov
     learning_rate: 0.01
     adaptive_lr: True
-    lr_range: [0.01, 0.1]
+    lr_range: [0.002, 0.1]
     # M | [M, Q]: M - hebb, Q - anti-hebb; ints or floats — absolute or relative to K
     learning_set: [0.75, 0.75]
     anti_hebb_scale: 0.8
@@ -211,8 +214,11 @@ setups:
 #    contrastive: True
 #    encoding_sds: [4000, 40]
 #    encoding_sds: [2000, 20]
+#    encoding_sds: [2000, 12]
 #    encoding_sds: [1000, 10]
-    encoding_sds: [600, 7]
+#    encoding_sds: [1000, 6]
+#    encoding_sds: [600, 7]
+    encoding_sds: [600, 4]
 #    encoding_sds: [100, 2]
   binary_htm_sparse:
     encoder:
